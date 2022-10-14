@@ -4,3 +4,4 @@ transformers
 diffusers
 ftfy
 pydantic
+gcloud

@@ -11,6 +11,7 @@ python:
     - diffusers
     - ftfy
     - pydantic
+    - gcloud
 docker:
     distro: debian
     cuda_version: "11.6.2"

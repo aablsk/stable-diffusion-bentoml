@@ -1,6 +1,7 @@
 from contextlib import ExitStack
 
 import torch
+from typing import List
 from torch import autocast
 from diffusers import StableDiffusionPipeline
 from diffusers import StableDiffusionImg2ImgPipeline
@@ -9,6 +10,11 @@ from diffusers import StableDiffusionInpaintPipeline
 from pydantic import BaseModel
 import bentoml
 from bentoml.io import Image, JSON, Multipart
+
+from gcloud import storage
+import os
+from datetime import datetime
+import io
 
 class StableDiffusionRunnable(bentoml.Runnable):
     SUPPORTED_RESOURCES = ("nvidia.com/gpu", "cpu")
@@ -44,7 +50,7 @@ class StableDiffusionRunnable(bentoml.Runnable):
 
     @bentoml.Runnable.method(batchable=False, batch_dim=0)
     def txt2img(self, data):
-        prompt = data["prompt"]
+        prompt = data.get('prompt')
         guidance_scale = data.get('guidance_scale', 7.5)
         height = data.get('height', 512)
         width = data.get('width', 512)
@@ -58,7 +64,6 @@ class StableDiffusionRunnable(bentoml.Runnable):
         with ExitStack() as stack:
             if self.device != "cpu":
                 _ = stack.enter_context(autocast(self.device))
-
             images = self.txt2img_pipe(
                 prompt=prompt,
                 guidance_scale=guidance_scale,
@@ -134,6 +139,17 @@ class StableDiffusionRunnable(bentoml.Runnable):
             ).images
             image = images[0]
             return image
+        
+def upload2gcs(image, prompt):
+    client = storage.Client(project=os.environ['PROJECT_ID'])
+    bucket = client.get_bucket(os.environ['BUCKET'])
+    blob_name = str(datetime.now().microsecond) + prompt + '.png'
+    blob = bucket.blob(blob_name)
+    link = 'https://storage.cloud.google.com/' + os.environ['BUCKET'] + '/' + blob_name
+    img_byte_arr = io.BytesIO()
+    image.save(img_byte_arr, format='PNG')
+    blob.upload_from_string(img_byte_arr.getvalue(), content_type='image/png')
+    return link
 
 
 stable_diffusion_runner = bentoml.Runner(StableDiffusionRunnable, name='stable_diffusion_runner', max_batch_size=10)
@@ -146,7 +162,7 @@ def generate_seed_if_needed(seed):
         seed = torch.seed()
     return seed
 
-class Txt2ImgInput(BaseModel):
+class Instances(BaseModel):
     prompt: str
     guidance_scale: float = 7.5
     height: int = 512
@@ -154,15 +170,22 @@ class Txt2ImgInput(BaseModel):
     num_inference_steps: int = 50
     safety_check: bool = True
     seed: int = None
+    
+class Txt2ImgInput(BaseModel):
+    instances: List[Instances]    
 
-@svc.api(input=JSON(pydantic_model=Txt2ImgInput), output=Image())
+@svc.api(input=JSON(pydantic_model=Txt2ImgInput), output=JSON())
 def txt2img(data, context):
-    data = data.dict()
+    data = data.instances[0].dict()
     data['seed'] = generate_seed_if_needed(data['seed'])
+    print(data.get('prompt'))
+    print(str(data))
+    prompt = data.get('prompt')
     image = stable_diffusion_runner.txt2img.run(data)
     for i in data:
         context.response.headers.append(i, str(data[i]))
-    return image
+    link = upload2gcs(image, prompt)
+    return {'predictions': [{'link': link}]}
 
 class Img2ImgInput(BaseModel):
     prompt: str
